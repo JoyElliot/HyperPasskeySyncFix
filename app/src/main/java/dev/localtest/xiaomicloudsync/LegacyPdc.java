@@ -8,6 +8,7 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -45,6 +46,12 @@ final class LegacyPdc {
         Class<?> response = loader.loadClass("O3.a");
         success = response.getDeclaredField("a");
         data = response.getDeclaredField("f");
+        if (!Modifier.isStatic(request.getModifiers()) || !response.isAssignableFrom(request.getReturnType())) {
+            throw new NoSuchMethodException(request.toString());
+        }
+        if (success.getType() != boolean.class || data.getType().isPrimitive()) {
+            throw new NoSuchFieldException(response.getName() + " result fields");
+        }
     }
 
     long masterKeyVersion() throws Exception {

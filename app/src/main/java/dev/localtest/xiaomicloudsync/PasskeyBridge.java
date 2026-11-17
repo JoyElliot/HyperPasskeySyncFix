@@ -17,7 +17,9 @@ import android.os.Parcelable;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -42,6 +44,8 @@ final class PasskeyBridge {
 
     record Report(int uploaded, int restored, int deleted, boolean retry, boolean morePages) {}
 
+    record Targets(Method account, Method switchEnabled, LegacyPdc pdc, Field keyInfoCreator, Field keyInfoVersion) {}
+
     private record Local(long row, String credential, String rp, String uniqueKey, String id,
                          long etag, String status, int state, long modified, String owner, long version) {
         boolean removing() {
@@ -54,26 +58,36 @@ final class PasskeyBridge {
     }
 
     private final Application context;
-    private final ClassLoader loader;
-    private final Method getAccount;
-    private final Method switchEnabled;
+    private final Targets targets;
     private final LegacyPdc pdc;
     private final ContentResolver resolver;
     private final SharedPreferences cursors;
 
-    PasskeyBridge(Application context, ClassLoader loader) throws Exception {
+    PasskeyBridge(Application context, Targets targets) {
         this.context = context;
-        this.loader = loader;
-        getAccount = loader.loadClass("miui.accounts.ExtraAccountManager")
-                .getMethod("getXiaomiAccount", Context.class);
-        switchEnabled = loader.loadClass("w2.d").getDeclaredMethod("l");
-        pdc = new LegacyPdc(loader);
+        this.targets = targets;
+        pdc = targets.pdc();
         resolver = context.getContentResolver();
         cursors = context.getSharedPreferences("xiaomi_legacy_passkey_cursors", Context.MODE_PRIVATE);
     }
 
+    static Targets resolveTargets(ClassLoader loader, Method account) throws ReflectiveOperationException {
+        Method switchEnabled = loader.loadClass("w2.d").getDeclaredMethod("l");
+        if (switchEnabled.getReturnType() != boolean.class || !Modifier.isStatic(switchEnabled.getModifiers())) {
+            throw new NoSuchMethodException(switchEnabled.toString());
+        }
+        Class<?> keyInfo = loader.loadClass("com.xiaomi.micloudkeybag.KeyBagKeyInfo");
+        Field creator = keyInfo.getField("CREATOR");
+        Field version = keyInfo.getDeclaredField("a");
+        if (!Modifier.isStatic(creator.getModifiers()) || !Parcelable.Creator.class.isAssignableFrom(creator.getType())
+                || Modifier.isStatic(version.getModifiers()) || version.getType() != long.class) {
+            throw new NoSuchFieldException(keyInfo.getName() + " parcel format");
+        }
+        return new Targets(account, switchEnabled, new LegacyPdc(loader), creator, version);
+    }
+
     Report sync(Account account) throws Exception {
-        if (account == null || !active(account) || !(Boolean) switchEnabled.invoke(null)) {
+        if (account == null || !active(account) || !(Boolean) targets.switchEnabled().invoke(null)) {
             return null;
         }
         long version = installedVersion(account);
@@ -499,8 +513,7 @@ final class PasskeyBridge {
     }
 
     private long installedVersion(Account account) throws Exception {
-        Class<?> keyInfo = loader.loadClass("com.xiaomi.micloudkeybag.KeyBagKeyInfo");
-        Parcelable.Creator<?> creator = (Parcelable.Creator<?>) keyInfo.getField("CREATOR").get(null);
+        Parcelable.Creator<?> creator = (Parcelable.Creator<?>) targets.keyInfoCreator().get(null);
         try (BoundService service = new BoundService(context, "com.miui.cloudservice.MICLOUD_KEYBAG", CLOUD)) {
             IBinder binder = service.binder();
             Parcel data = Parcel.obtain(binder);
@@ -513,7 +526,7 @@ final class PasskeyBridge {
                 }
                 reply.readException();
                 Object installed = reply.readTypedObject(creator);
-                return installed == null ? 0 : keyInfo.getDeclaredField("a").getLong(installed);
+                return installed == null ? 0 : targets.keyInfoVersion().getLong(installed);
             } finally {
                 data.recycle();
                 reply.recycle();
@@ -541,7 +554,7 @@ final class PasskeyBridge {
     }
 
     private boolean active(Account account) throws Exception {
-        return account.equals(getAccount.invoke(null, context)) && ContentResolver.getMasterSyncAutomatically()
+        return account.equals(targets.account().invoke(null, context)) && ContentResolver.getMasterSyncAutomatically()
                 && ContentResolver.getSyncAutomatically(account, AUTHORITY);
     }
 

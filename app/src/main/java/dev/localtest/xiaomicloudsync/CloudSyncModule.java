@@ -19,15 +19,11 @@ import android.util.Log;
 
 import io.github.libxposed.api.XposedModule;
 
-import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.security.MessageDigest;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class CloudSyncModule extends XposedModule {
@@ -35,10 +31,6 @@ public final class CloudSyncModule extends XposedModule {
     private static final String PASSWORDS = "com.miui.passwords";
     private static final String CLOUD = PasskeyBridge.CLOUD;
     private static final String FIDO_ASM = "com.fido.asm";
-    private static final String CLOUD_SHA256 =
-            "6203237113ac354f01f97acb6ffe4fb1f995fefc6fc11ad1f6e23d1f39999832";
-    private static final String PASSWORDS_SHA256 =
-            "021e11b6f6626d72a339da1e223f7276f55ae8c25893e1c4e7cf557327e23dc0";
     private static final String FIDO_CALLBACK = "com.miui.credential.ICredentialPassService";
 
     private final AtomicBoolean gateLogged = new AtomicBoolean();
@@ -50,61 +42,64 @@ public final class CloudSyncModule extends XposedModule {
 
     @Override
     public void onPackageReady(PackageReadyParam param) {
-        if (!param.isFirstPackage() || !"marble".equals(Build.DEVICE)
-                || !"OS4.0.6.0.XPCCNXM".equals(Build.VERSION.INCREMENTAL)) {
+        if (!param.isFirstPackage() || !"marble".equals(Build.DEVICE)) {
             return;
         }
 
-        try {
-            String process = Application.getProcessName();
-            String name = param.getPackageName();
-            ClassLoader loader = param.getClassLoader();
-            String apk = param.getApplicationInfo().sourceDir;
-            if (CLOUD.equals(name) && CLOUD.equals(process) && matchesApk(apk, CLOUD_SHA256)) {
-                registerCloudGate(loader);
-                registerVersionReader(loader);
+        String process = Application.getProcessName();
+        String name = param.getPackageName();
+        ClassLoader loader = param.getClassLoader();
+        try (HookGroup hooks = new HookGroup()) {
+            if (CLOUD.equals(name) && CLOUD.equals(process)) {
+                registerCloudGate(loader, hooks);
+                registerVersionReader(loader, hooks);
+            } else if (PASSWORDS.equals(name) && (PASSWORDS + ":sync").equals(process)) {
+                Method account = xiaomiAccount(loader);
+                Field app = passwordsAppField(loader);
+                registerPasskeySync(loader, hooks, account, app);
+                registerNativeEvents(loader, hooks, account, app);
+            } else if (PASSWORDS.equals(name) && PASSWORDS.equals(process)) {
+                registerScheduling(loader, hooks);
+            } else {
+                return;
             }
-            if (PASSWORDS.equals(name) && matchesApk(apk, PASSWORDS_SHA256)) {
-                if ((PASSWORDS + ":sync").equals(process)) {
-                    registerPasskeySync(loader);
-                    registerNativeEvents(loader);
-                } else if (PASSWORDS.equals(process)) {
-                    registerScheduling(loader);
-                }
-            }
-        } catch (Exception | LinkageError failure) {
-            logFailure("Module setup", failure);
+            hooks.activate();
+            log(Log.INFO, TAG, "Passkey sync hooks active in " + process);
+        } catch (ReflectiveOperationException failure) {
+            log(Log.WARN, TAG, "Incompatible hook targets in " + process + ": " + failure);
+        } catch (RuntimeException | LinkageError failure) {
+            logFailure("Hook setup in " + process, failure);
         }
     }
 
-    private void registerCloudGate(ClassLoader loader) throws ReflectiveOperationException {
+    private void registerCloudGate(ClassLoader loader, HookGroup hooks) throws ReflectiveOperationException {
         Class<?> appKeys = loader.loadClass("B2.a");
-        Method supportsFido = appKeys.getDeclaredMethod("e");
-        if (supportsFido.getReturnType() != boolean.class) {
-            throw new NoSuchMethodException("Unexpected FIDO support method");
-        }
-
+        Method supportsFido = requiredMethod(appKeys, "e", boolean.class);
         deoptimize(appKeys.getDeclaredMethod("f", Context.class));
         Class<?> passwordSync = loader.loadClass("y2.a");
         deoptimize(passwordSync.getDeclaredMethod("g", Context.class, String.class));
-        hook(supportsFido).intercept(chain -> {
+        hooks.intercept(supportsFido, chain -> {
             if (gateLogged.compareAndSet(false, true)) {
                 log(Log.INFO, TAG, "Skipped modern FIDO initialization in CloudService");
             }
             return false;
         });
-        log(Log.INFO, TAG, "Password sync gate registered");
     }
 
-    private void registerVersionReader(ClassLoader loader) throws ReflectiveOperationException {
+    private void registerVersionReader(ClassLoader loader, HookGroup hooks) throws ReflectiveOperationException {
         Class<?> stub = loader.loadClass(PasskeyBridge.KEYBOX_DESCRIPTOR + "$Stub");
-        Method onTransact = stub.getDeclaredMethod("onTransact", int.class, Parcel.class, Parcel.class, int.class);
-        Method cloudApp = loader.loadClass(CLOUD + ".CloudApp").getDeclaredMethod("g");
+        Method onTransact = requiredMethod(stub, "onTransact", boolean.class,
+                int.class, Parcel.class, Parcel.class, int.class);
+        Method cloudApp = requiredStatic(loader.loadClass(CLOUD + ".CloudApp").getDeclaredMethod("g"),
+                Context.class);
         Method account = xiaomiAccount(loader);
-        Method nativeService = loader.loadClass("R1.g").getDeclaredMethod("e");
-        Method nativeVersion = loader.loadClass("vendor.xiaomi.hardware.mikeybag.IMiKeyBagService")
-                .getMethod("getMasterKeyVersion", String.class);
-        hook(onTransact).intercept(chain -> {
+        Class<?> keyBag = loader.loadClass("vendor.xiaomi.hardware.mikeybag.IMiKeyBagService");
+        Method nativeService = requiredStatic(loader.loadClass("R1.g").getDeclaredMethod("e"), keyBag);
+        Method nativeVersion = keyBag.getMethod("getMasterKeyVersion", String.class);
+        if (nativeVersion.getReturnType() != long.class || Modifier.isStatic(nativeVersion.getModifiers())) {
+            throw new NoSuchMethodException(nativeVersion.toString());
+        }
+        hooks.intercept(onTransact, chain -> {
             if ((Integer) chain.getArg(0) != PasskeyBridge.TA_VERSION_TRANSACTION) {
                 return chain.proceed();
             }
@@ -138,13 +133,14 @@ public final class CloudSyncModule extends XposedModule {
             reply.writeLong(version);
             return true;
         });
-        log(Log.INFO, TAG, "Legacy TA version reader registered");
     }
 
-    private void registerPasskeySync(ClassLoader loader) throws ReflectiveOperationException {
-        Method onPerformSync = loader.loadClass("T3.e").getDeclaredMethod("onPerformSync",
+    private void registerPasskeySync(ClassLoader loader, HookGroup hooks, Method accountLookup, Field app)
+            throws ReflectiveOperationException {
+        PasskeyBridge.Targets targets = PasskeyBridge.resolveTargets(loader, accountLookup);
+        Method onPerformSync = requiredMethod(loader.loadClass("T3.e"), "onPerformSync", void.class,
                 Account.class, Bundle.class, String.class, ContentProviderClient.class, SyncResult.class);
-        hook(onPerformSync).intercept(chain -> {
+        hooks.intercept(onPerformSync, chain -> {
             stockSync.set(new ScheduledSync((Account) chain.getArg(0), (SyncResult) chain.getArg(4)));
             try {
                 return chain.proceed();
@@ -153,8 +149,7 @@ public final class CloudSyncModule extends XposedModule {
             }
         });
         Class<?> fidoSync = loader.loadClass("O2.e");
-        Method accountLookup = xiaomiAccount(loader);
-        hook(accountLookup).intercept(chain -> {
+        hooks.intercept(accountLookup, chain -> {
             Object current = chain.proceed();
             Account expected = legacyAccount.get();
             if (expected != null && !expected.equals(current)) {
@@ -165,13 +160,18 @@ public final class CloudSyncModule extends XposedModule {
         Class<?> requestEnvironment = loader.loadClass("Q2.a");
         deoptimize(requestEnvironment.getDeclaredMethod("w"));
         deoptimize(requestEnvironment.getDeclaredMethod("z"));
-        Method cloudEnvironment = loader.loadClass("R3.c").getDeclaredMethod("b");
+        Method cloudEnvironment = requiredStatic(loader.loadClass("R3.c").getDeclaredMethod("b"),
+                requestEnvironment);
         Field environmentBuilder = requestEnvironment.getDeclaredField("b");
         Field tokenProvider = loader.loadClass("X3.a").getDeclaredField("b");
         Field cache = loader.loadClass("M4.h").getDeclaredField("b");
+        if (environmentBuilder.getType().isPrimitive() || tokenProvider.getType().isPrimitive()
+                || !ThreadLocal.class.isAssignableFrom(cache.getType())) {
+            throw new NoSuchFieldException("Unexpected cloud request environment fields");
+        }
         deoptimize(loader.loadClass("P2.d").getDeclaredMethod("d", Bundle.class));
-        deoptimize(loader.loadClass("Q2.a").getDeclaredMethod("t"));
-        hook(fidoSync.getDeclaredMethod("c")).intercept(chain -> {
+        deoptimize(requestEnvironment.getDeclaredMethod("t"));
+        hooks.intercept(requiredMethod(fidoSync, "c", void.class), chain -> {
             ScheduledSync run = stockSync.get();
             if (run != null && run.account != null && run.result != null) {
                 SyncResult frameworkResult = run.result;
@@ -184,7 +184,7 @@ public final class CloudSyncModule extends XposedModule {
                     legacyAccount.set(run.account);
                     requestToken.remove();
                     try {
-                        PasskeyBridge bridge = new PasskeyBridge(passwordsApp(loader), loader);
+                        PasskeyBridge bridge = new PasskeyBridge((Application) app.get(null), targets);
                         report = bridge.sync(run.account);
                     } finally {
                         legacyAccount.remove();
@@ -211,39 +211,39 @@ public final class CloudSyncModule extends XposedModule {
         });
         // The phone's KeyBag ABI cannot service the modern FIDO sync path.
         // These three methods belong to FIDO only; the Passwords adapter remains native.
-        hook(fidoSync.getDeclaredMethod("b")).intercept(chain -> null);
-        hook(fidoSync.getDeclaredMethod("e")).intercept(chain -> null);
-        log(Log.INFO, TAG, "Legacy passkey SyncAdapter registered");
+        hooks.intercept(requiredMethod(fidoSync, "b", void.class), chain -> null);
+        hooks.intercept(requiredMethod(fidoSync, "e", void.class), chain -> null);
     }
 
-    private void registerNativeEvents(ClassLoader loader) throws ReflectiveOperationException {
-        Class<?> binder = loader.loadClass("O2.a");
-        hook(binder.getDeclaredMethod("onTransact", int.class, Parcel.class, Parcel.class, int.class))
-                .intercept(chain -> {
-                    if ((Integer) chain.getArg(0) != 1 || !(chain.getThisObject() instanceof Binder instance)
-                            || !FIDO_CALLBACK.equals(instance.getInterfaceDescriptor())) {
-                        return chain.proceed();
-                    }
-                    Application app;
-                    try {
-                        app = passwordsApp(loader);
-                        if (!callerIs(app, Binder.getCallingUid(), FIDO_ASM)) {
-                            return chain.proceed();
-                        }
-                        noteNativeRemoval(app, loader, (Parcel) chain.getArg(1));
-                    } catch (Exception failure) {
-                        logFailure("Native passkey event", failure);
-                        return chain.proceed();
-                    }
-                    Object result = chain.proceed();
-                    if (Boolean.TRUE.equals(result)) {
-                        requestSoon(app, loader);
-                    }
-                    return result;
-                });
+    private void registerNativeEvents(ClassLoader loader, HookGroup hooks, Method accountLookup, Field appField)
+            throws ReflectiveOperationException {
+        Method onTransact = requiredMethod(loader.loadClass("O2.a"), "onTransact", boolean.class,
+                int.class, Parcel.class, Parcel.class, int.class);
+        hooks.intercept(onTransact, chain -> {
+            if ((Integer) chain.getArg(0) != 1 || !(chain.getThisObject() instanceof Binder instance)
+                    || !FIDO_CALLBACK.equals(instance.getInterfaceDescriptor())) {
+                return chain.proceed();
+            }
+            Application app;
+            try {
+                app = (Application) appField.get(null);
+                if (!callerIs(app, Binder.getCallingUid(), FIDO_ASM)) {
+                    return chain.proceed();
+                }
+                noteNativeRemoval(app, accountLookup, (Parcel) chain.getArg(1));
+            } catch (Exception failure) {
+                logFailure("Native passkey event", failure);
+                return chain.proceed();
+            }
+            Object result = chain.proceed();
+            if (Boolean.TRUE.equals(result)) {
+                requestSoon(app, accountLookup);
+            }
+            return result;
+        });
     }
 
-    private static void noteNativeRemoval(Application app, ClassLoader loader, Parcel original) throws Exception {
+    private static void noteNativeRemoval(Application app, Method accountLookup, Parcel original) throws Exception {
         Parcel payload = Parcel.obtain();
         try {
             payload.appendFrom(original, 0, original.dataSize());
@@ -253,7 +253,7 @@ public final class CloudSyncModule extends XposedModule {
                 return;
             }
             ArrayList<String> credentials = payload.createStringArrayList();
-            Account account = (Account) xiaomiAccount(loader).invoke(null, app);
+            Account account = (Account) accountLookup.invoke(null, app);
             if (account != null && credentials != null && !credentials.isEmpty()) {
                 PasskeyBridge.noteNativeRemoval(app, account, credentials);
             }
@@ -262,16 +262,18 @@ public final class CloudSyncModule extends XposedModule {
         }
     }
 
-    private void registerScheduling(ClassLoader loader) throws ReflectiveOperationException {
-        Class<?> app = loader.loadClass(PASSWORDS + ".PasswordsApp");
-        hook(app.getDeclaredMethod("onCreate")).intercept(chain -> {
+    private void registerScheduling(ClassLoader loader, HookGroup hooks) throws ReflectiveOperationException {
+        Field instance = passwordsAppField(loader);
+        Method accountLookup = xiaomiAccount(loader);
+        hooks.intercept(requiredMethod(instance.getDeclaringClass(), "onCreate", void.class), chain -> {
             Object result = chain.proceed();
-            requestSoon((Application) chain.getThisObject(), loader);
+            requestSoon((Application) chain.getThisObject(), accountLookup);
             return result;
         });
         Class<?> provider = loader.loadClass(PASSWORDS + ".datacenter.db.PrivacyDataProvider");
-        Method update = provider.getDeclaredMethod("update", Uri.class, ContentValues.class, String.class, String[].class);
-        hook(update).intercept(chain -> {
+        Method update = requiredMethod(provider, "update", int.class, Uri.class, ContentValues.class,
+                String.class, String[].class);
+        hooks.intercept(update, chain -> {
             Object result = chain.proceed();
             Uri uri = (Uri) chain.getArg(0);
             ContentValues values = (ContentValues) chain.getArg(1);
@@ -279,7 +281,7 @@ public final class CloudSyncModule extends XposedModule {
                     && "content://miui.autofill/fido_credential_summary_record".equals(uri.toString())
                     && values.containsKey("localStatus")) {
                 try {
-                    requestSoon(passwordsApp(loader), loader);
+                    requestSoon((Application) instance.get(null), accountLookup);
                 } catch (Exception failure) {
                     logFailure("Passkey management change", failure);
                 }
@@ -288,14 +290,14 @@ public final class CloudSyncModule extends XposedModule {
         });
     }
 
-    private void requestSoon(Application app, ClassLoader loader) {
+    private void requestSoon(Application app, Method accountLookup) {
         if (app == null || !syncRequested.compareAndSet(false, true)) {
             return;
         }
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             syncRequested.set(false);
             try {
-                Account current = (Account) xiaomiAccount(loader).invoke(null, app);
+                Account current = (Account) accountLookup.invoke(null, app);
                 if (current != null && ContentResolver.getMasterSyncAutomatically()
                         && ContentResolver.getSyncAutomatically(current, PasskeyBridge.AUTHORITY)) {
                     Bundle extras = PasskeyBridge.syncExtras();
@@ -313,14 +315,33 @@ public final class CloudSyncModule extends XposedModule {
     }
 
     private static Method xiaomiAccount(ClassLoader loader) throws ReflectiveOperationException {
-        return loader.loadClass("miui.accounts.ExtraAccountManager")
-                .getMethod("getXiaomiAccount", Context.class);
+        return requiredStatic(loader.loadClass("miui.accounts.ExtraAccountManager")
+                .getMethod("getXiaomiAccount", Context.class), Account.class);
     }
 
-    private static Application passwordsApp(ClassLoader loader) throws ReflectiveOperationException {
+    private static Field passwordsAppField(ClassLoader loader) throws ReflectiveOperationException {
         Field instance = loader.loadClass(PASSWORDS + ".PasswordsApp").getDeclaredField("g");
+        if (!Modifier.isStatic(instance.getModifiers()) || !Application.class.isAssignableFrom(instance.getType())) {
+            throw new NoSuchFieldException(instance.toString());
+        }
         instance.setAccessible(true);
-        return (Application) instance.get(null);
+        return instance;
+    }
+
+    private static Method requiredMethod(Class<?> type, String name, Class<?> returnType, Class<?>... parameters)
+            throws NoSuchMethodException {
+        Method method = type.getDeclaredMethod(name, parameters);
+        if (method.getReturnType() != returnType) {
+            throw new NoSuchMethodException(method.toString());
+        }
+        return method;
+    }
+
+    private static Method requiredStatic(Method method, Class<?> returnType) throws NoSuchMethodException {
+        if (!Modifier.isStatic(method.getModifiers()) || !returnType.isAssignableFrom(method.getReturnType())) {
+            throw new NoSuchMethodException(method.toString());
+        }
+        return method;
     }
 
     private void logFailure(String operation, Throwable failure) {
@@ -328,14 +349,28 @@ public final class CloudSyncModule extends XposedModule {
         log(Log.WARN, TAG, operation + " failed: " + cause.getClass().getSimpleName());
     }
 
-    private boolean matchesApk(String sourceDir, String expected) throws Exception {
-        MessageDigest sha = MessageDigest.getInstance("SHA-256");
-        try (InputStream apk = Files.newInputStream(Path.of(sourceDir))) {
-            byte[] buffer = new byte[64 * 1024];
-            for (int size; (size = apk.read(buffer)) != -1;) {
-                sha.update(buffer, 0, size);
+    private final class HookGroup implements AutoCloseable {
+        private final ArrayList<HookHandle> handles = new ArrayList<>();
+        private volatile boolean active;
+
+        void intercept(Method method, Hooker hooker) {
+            handles.add(hook(method).intercept(chain -> active ? hooker.intercept(chain) : chain.proceed()));
+        }
+
+        void activate() {
+            active = true;
+            handles.clear();
+        }
+
+        @Override
+        public void close() {
+            for (int index = handles.size() - 1; index >= 0; index--) {
+                try {
+                    handles.get(index).unhook();
+                } catch (RuntimeException | LinkageError failure) {
+                    logFailure("Removing inactive hook", failure);
+                }
             }
         }
-        return expected.equals(HexFormat.of().formatHex(sha.digest()));
     }
 }

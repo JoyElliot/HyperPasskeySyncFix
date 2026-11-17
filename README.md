@@ -10,9 +10,9 @@ An LSPosed fix for Xiaomi's native passkey cloud sync on older devices ported to
 
 | 机型 | 固件 | 验证范围 |
 | --- | --- | --- |
-| Redmi Note 12 Turbo（`marble`） | `OS4.0.6.0.XPCCNXM` 移植包，目标 APK 与源码中的 SHA-256 一致 | 实机验证自动上传、恢复、恢复后网页验签、双向软删除，以及从「最近删除」恢复 |
+| Redmi Note 12 Turbo（`marble`） | `OS4.0.6.0.XPCCNXM` 江南移植包 | 实机验证自动上传、恢复、恢复后网页验签、双向软删除，以及从「最近删除」恢复 |
 
-REDMI Note 12 Turbo（`marble`）上的上述组合已通过实机测试。云端恢复测试通过移除同一台设备上的测试副本完成。其他旧机型的移植包可能遇到同样的接口失配，实际适配需单独核对。目前模块会校验机型、固件版本和两个目标 APK 的 SHA-256。
+云端恢复测试通过移除同一台设备上的测试副本完成。模块在 `marble` 上按各进程所需的 Hook 点和反射接口判断兼容性。同一机型可以尝试不同固件和 APK 版本。如果接口变动导致安装失败，该进程的模块 Hook 会保持停用。其他机型需要单独适配 KeyBag 和 FIDO 服务。
 
 旧版 Xiaomi MasterKey 必须已经恢复到系统并写入 TEE。同步前，模块会确认系统安装版本、TEE 版本和旧云空间版本三者相同。旧密钥的初次恢复和 TEE 导入需要原厂流程处理。云端删除使用旧服务的软删除语义。
 
