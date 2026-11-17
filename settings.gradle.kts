@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "HyperOSPasskeyBridge"
+rootProject.name = "HyperPasskeySyncFix"
 include(":app")
