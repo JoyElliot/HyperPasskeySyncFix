@@ -5,14 +5,14 @@ plugins {
 android {
     enableKotlin = false
     namespace = "dev.localtest.xiaomicloudsync"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "dev.localtest.xiaomicloudsync"
         minSdk = 34
-        targetSdk = 36
-        versionCode = 19
-        versionName = "0.17.2"
+        targetSdk = 37
+        versionCode = 20
+        versionName = "0.18.0"
     }
 
     compileOptions {

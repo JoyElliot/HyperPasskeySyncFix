@@ -16,6 +16,8 @@ An LSPosed fix for Xiaomi's native passkey cloud sync on older devices ported to
 
 旧版 Xiaomi MasterKey 必须已经恢复到系统并写入 TEE。同步前，模块会确认系统安装版本、TEE 版本和旧云空间版本三者相同。旧密钥的初次恢复和 TEE 导入需要原厂流程处理。云端删除使用旧服务的软删除语义。
 
+本地扫描只读取待处理的记录。若创建请求已到达云端、设备却没收到确认，模块会在下次同步时核对创建时的显示信息，再决定保留哪一端的改名。两端都有不同修改且无法判断先后时，会保留两端的数据，并在同步日志的 `conflicts` 中计数。
+
 ## 使用
 
 1. 从 [Releases](https://github.com/JoyElliot/HyperPasskeySyncFix/releases) 下载并安装 APK。
@@ -26,7 +28,7 @@ An LSPosed fix for Xiaomi's native passkey cloud sync on older devices ported to
 
 ## 构建
 
-准备 JDK 17 或更高版本、Android SDK Platform 36 和 Build Tools 36.0.0。配置 `ANDROID_HOME`，或在 Android Studio 中指定 SDK 路径。
+准备 JDK 17 或更高版本、Android SDK Platform 37.0 和 Build Tools 36.0.0。模块以 Android 17（API 37）为目标，最低安装版本为 Android 14（API 34）。配置 `ANDROID_HOME`，或在 Android Studio 中指定 SDK 路径。
 
 ```sh
 ./gradlew :app:assembleDebug

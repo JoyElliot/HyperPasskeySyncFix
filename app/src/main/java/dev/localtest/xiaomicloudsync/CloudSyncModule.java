@@ -35,6 +35,8 @@ public final class CloudSyncModule extends XposedModule {
 
     private final AtomicBoolean gateLogged = new AtomicBoolean();
     private final AtomicBoolean syncRequested = new AtomicBoolean();
+    // Accessed only by the debounced callback on the process main looper.
+    private Account periodicAccount;
     private record ScheduledSync(Account account, SyncResult result) {}
 
     private final ThreadLocal<ScheduledSync> stockSync = new ThreadLocal<>();
@@ -194,14 +196,17 @@ public final class CloudSyncModule extends XposedModule {
                         }
                     }
                     if (report != null) {
-                        log(Log.INFO, TAG, "Legacy passkey sync uploaded=" + report.uploaded()
-                                + " restored=" + report.restored() + " deleted=" + report.deleted()
-                                + " retry=" + report.retry());
-                        frameworkResult.moreRecordsToGet |= report.morePages();
-                        if (report.retry()) {
+                        log(Log.INFO, TAG, "Legacy passkey sync uploaded=" + report.uploaded
+                                + " restored=" + report.restored + " deleted=" + report.deleted
+                                + " pending=" + report.pending + " received=" + report.received
+                                + " conflicts=" + report.conflicts + " retry=" + report.retry);
+                        frameworkResult.moreRecordsToGet |= report.morePages;
+                        if (report.retry) {
                             frameworkResult.stats.numIoExceptions++;
                         }
                     }
+                } catch (InterruptedException cancelled) {
+                    Thread.currentThread().interrupt();
                 } catch (Exception | LinkageError failure) {
                     frameworkResult.stats.numIoExceptions++;
                     logFailure("Legacy passkey sync", failure);
@@ -301,8 +306,13 @@ public final class CloudSyncModule extends XposedModule {
                 if (current != null && ContentResolver.getMasterSyncAutomatically()
                         && ContentResolver.getSyncAutomatically(current, PasskeyBridge.AUTHORITY)) {
                     Bundle extras = PasskeyBridge.syncExtras();
-                    ContentResolver.addPeriodicSync(current, PasskeyBridge.AUTHORITY, extras, 15 * 60L);
                     ContentResolver.requestSync(current, PasskeyBridge.AUTHORITY, extras);
+                    if (!current.equals(periodicAccount)) {
+                        ContentResolver.addPeriodicSync(current, PasskeyBridge.AUTHORITY, extras, 15 * 60L);
+                        periodicAccount = current;
+                    }
+                } else {
+                    periodicAccount = null;
                 }
             } catch (Exception | LinkageError failure) {
                 logFailure("Legacy passkey scheduling", failure);

@@ -7,6 +7,7 @@ import org.json.JSONObject;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
@@ -128,8 +129,16 @@ final class LegacyPdc {
     }
 
     private JSONObject send(String url, HashMap<String, String> fields, boolean get) throws Exception {
-        Object reply = request.invoke(null, url, fields, get);
-        if (!success.getBoolean(reply) || !(data.get(reply) instanceof JSONObject body)) {
+        Object reply;
+        try {
+            reply = request.invoke(null, url, fields, get);
+        } catch (InvocationTargetException failure) {
+            if (failure.getCause() instanceof Exception cause) {
+                throw cause;
+            }
+            throw failure;
+        }
+        if (reply == null || !success.getBoolean(reply) || !(data.get(reply) instanceof JSONObject body)) {
             throw new IOException("Legacy PDC request failed");
         }
         return body;

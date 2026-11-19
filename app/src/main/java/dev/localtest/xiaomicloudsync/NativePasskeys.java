@@ -34,11 +34,11 @@ final class NativePasskeys implements AutoCloseable {
         }
     }
 
-    private final BoundService service;
+    private final Context context;
+    private BoundService service;
 
-    NativePasskeys(Context context) throws RemoteException {
-        service = new BoundService(context, "org.fidoalliance.aidl.service.PASSKEY_OPERATION",
-                "com.fido.asm");
+    NativePasskeys(Context context) {
+        this.context = context;
     }
 
     Export export(String credential, long version) throws Exception {
@@ -125,6 +125,9 @@ final class NativePasskeys implements AutoCloseable {
             }
         };
         callback.attachInterface(null, callbackDescriptor);
+        if (service == null) {
+            service = new BoundService(context, "org.fidoalliance.aidl.service.PASSKEY_OPERATION", "com.fido.asm");
+        }
         IBinder binder = service.binder();
         Parcel request = Parcel.obtain(binder);
         try {
@@ -142,6 +145,8 @@ final class NativePasskeys implements AutoCloseable {
 
     @Override
     public void close() {
-        service.close();
+        if (service != null) {
+            service.close();
+        }
     }
 }

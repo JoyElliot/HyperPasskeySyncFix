@@ -13,6 +13,7 @@ import android.util.Log;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.Parcelable;
+import android.os.RemoteException;
 
 import org.json.JSONObject;
 
@@ -24,7 +25,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.TimeoutException;
 
 final class PasskeyBridge {
     static final String AUTHORITY = "miui.autofill";
@@ -36,18 +40,37 @@ final class PasskeyBridge {
 
     private static final String MARKER = "extensionStr3";
     private static final String[] FIELDS = {"_id", "credentialId", "rpId", "fidoUniqueId", "id", "eTag",
-            "status", "localStatus", "modificationTime", MARKER, "spaceVersion"};
+            "status", "localStatus", "modificationTime", MARKER, "spaceVersion", "displayName", "packageName"};
+    private static final String UNCHANGED = "_id=? AND localStatus=? AND modificationTime=? AND eTag=? "
+            + "AND IFNULL(displayName,'')=? AND IFNULL(packageName,'')=?";
     private static final int CLEAN = -1;
     private static final int UPDATED = 1;
     private static final int DELETED = 2;
     private static final int PURGED = 3;
 
-    record Report(int uploaded, int restored, int deleted, boolean retry, boolean morePages) {}
+    private static final String PENDING_ROWS = "((" + MARKER + "=? AND spaceVersion=?) OR ("
+            + MARKER + " IS NULL AND id IS NULL)) AND credentialId IS NOT NULL AND credentialId<>'' AND ("
+            + "(id IS NULL AND localStatus IN (-1,0,1)) OR (id IS NOT NULL AND (localStatus IN (1,3) OR "
+            + "(localStatus=2 AND (status IS NULL OR status NOT IN ('DELETED','PURGED'))))))";
+
+    private static final int MAX_DEFERRED = 16;
+
+    static final class Report {
+        int pending, received, uploaded, restored, deleted, conflicts;
+        boolean retry, morePages;
+    }
+
+    private static final class LocalConflict extends IOException {
+        LocalConflict(String message) {
+            super(message);
+        }
+    }
 
     record Targets(Method account, Method switchEnabled, LegacyPdc pdc, Field keyInfoCreator, Field keyInfoVersion) {}
 
     private record Local(long row, String credential, String rp, String uniqueKey, String id,
-                         long etag, String status, int state, long modified, String owner, long version) {
+                         long etag, String status, int state, long modified, String owner, long version,
+                         String displayName, String packageName) {
         boolean removing() {
             return state == DELETED || state == PURGED;
         }
@@ -104,75 +127,121 @@ final class PasskeyBridge {
         }
         String owner = accountOwner(account);
         String cursorKey = owner + "-" + version;
-        int uploaded = 0;
-        int restored = 0;
-        int deleted = 0;
-        boolean retry = false;
-        boolean morePages = false;
-
+        Report report = new Report();
+        List<Local> pending = query(PENDING_ROWS, owner, Long.toString(version));
+        report.pending = pending.size();
         try (NativePasskeys nativeKeys = new NativePasskeys(context)) {
-            for (Local row : query("(" + MARKER + " = ? OR (" + MARKER + " IS NULL AND id IS NULL)) "
-                    + "AND localStatus IN (-1,0,1,2,3)", owner)) {
+            for (Local row : pending) {
                 requireActive(account);
-                if (!eligible(row, owner, version) || !current(row)) {
-                    continue;
-                }
                 try {
                     if (row.removing()) {
-                        deleted += pushDeletion(account, nativeKeys, row, version);
-                    } else if (row.state == UPDATED || row.id == null) {
-                        uploaded += pushPasskey(account, nativeKeys, row, owner, version);
+                        report.deleted += pushDeletion(account, nativeKeys, row, version);
+                    } else {
+                        report.uploaded += pushPasskey(account, nativeKeys, row, owner, version);
                     }
+                } catch (InterruptedException | RemoteException | TimeoutException failure) {
+                    throw failure;
+                } catch (LocalConflict conflict) {
+                    report.conflicts++;
                 } catch (Exception failure) {
-                    retry = true;
+                    if (!report.retry) {
+                        Log.w("XiaomiCloudSyncTest", "Passkey upload failed: " + failure.getClass().getSimpleName());
+                    }
+                    report.retry = true;
                 }
             }
 
             long previousTag = cursors.getLong(cursorKey, 0);
             long receivedTag = cursors.getLong(cursorKey + "-max", previousTag);
             String cursor = cursors.getString(cursorKey + "-next", null);
-            boolean pullFailed = false;
+            Set<String> saved = cursors.getStringSet(cursorKey + "-deferred", Set.of());
+            Set<String> deferred = new HashSet<>(saved);
+            // Retry from the latest cloud revision. Only the record ID is retained on disk.
+            for (String id : saved) {
+                requireActive(account);
+                if (tryPull(account, nativeKeys, id, null, owner, version, report)) {
+                    deferred.remove(id);
+                }
+            }
+            boolean canAdvance = true;
             for (int page = 0; page < 10; page++) {
                 requireActive(account);
                 LegacyPdc.Page changes = pdc.changes(version, previousTag, cursor);
+                report.received += changes.records().size();
                 for (LegacyPdc.Record record : changes.records()) {
                     requireActive(account);
-                    try {
-                        if (record.live()) {
-                            restored += pullPasskey(account, nativeKeys, record, owner, version);
+                    if (!tryPull(account, nativeKeys, record.id(), record, owner, version, report)) {
+                        if (deferred.size() < MAX_DEFERRED || deferred.contains(record.id())) {
+                            deferred.add(record.id());
                         } else {
-                            deleted += pullDeletion(account, nativeKeys, record, owner, version);
+                            canAdvance = false;
                         }
-                    } catch (Exception failure) {
-                        pullFailed = true;
                     }
                     receivedTag = Math.max(receivedTag, record.etag());
                 }
-                cursor = changes.nextKey();
+                requireActive(account);
+                String next = changes.nextKey();
+                if (canAdvance && (next != null || cursor != null || receivedTag != previousTag || !deferred.equals(saved))) {
+                    saveCheckpoint(cursorKey, receivedTag, next, deferred);
+                }
+                cursor = next;
                 if (cursor == null) {
                     break;
                 }
-                if (page == 9) {
-                    // Resume an unfinished enumeration from the validated page boundary.
-                    morePages = true;
-                }
+                report.morePages = canAdvance && page == 9;
             }
-            requireActive(account);
-            retry |= pullFailed;
-            if (!pullFailed) {
-                SharedPreferences.Editor checkpoint = cursors.edit();
-                if (cursor == null) {
-                    checkpoint.putLong(cursorKey, receivedTag).remove(cursorKey + "-next")
-                            .remove(cursorKey + "-max");
-                } else {
-                    checkpoint.putString(cursorKey + "-next", cursor).putLong(cursorKey + "-max", receivedTag);
-                }
-                if (!checkpoint.commit()) {
-                    throw new IOException("Unable to store legacy PDC cursor");
-                }
+            if (!canAdvance) {
+                // Healthy records in this batch were still processed. Replay it from the last safe boundary.
+                saveDeferred(cursorKey, deferred);
             }
         }
-        return new Report(uploaded, restored, deleted, retry, morePages);
+        return report;
+    }
+
+    private boolean tryPull(Account account, NativePasskeys nativeKeys, String id, LegacyPdc.Record record,
+                            String owner, long version, Report report) throws Exception {
+        try {
+            if (record == null) {
+                record = pdc.get(id);
+                if (!id.equals(record.id())) {
+                    throw new IOException("Deferred cloud record identity mismatch");
+                }
+            }
+            if (record.live()) {
+                report.restored += pullPasskey(account, nativeKeys, record, owner, version);
+            } else {
+                report.deleted += pullDeletion(account, nativeKeys, record, owner, version);
+            }
+            return true;
+        } catch (InterruptedException | RemoteException | TimeoutException failure) {
+            throw failure;
+        } catch (Exception failure) {
+            if (!report.retry) {
+                Log.w("XiaomiCloudSyncTest", "Passkey download failed: " + failure.getClass().getSimpleName());
+            }
+            report.retry = true;
+            return false;
+        }
+    }
+
+    private void saveDeferred(String key, Set<String> deferred) throws IOException {
+        if (!deferred.equals(cursors.getStringSet(key + "-deferred", Set.of()))
+                && !cursors.edit().putStringSet(key + "-deferred", Set.copyOf(deferred)).commit()) {
+            throw new IOException("Unable to store deferred cloud records");
+        }
+    }
+
+    private void saveCheckpoint(String key, long tag, String next, Set<String> deferred) throws IOException {
+        SharedPreferences.Editor checkpoint = cursors.edit();
+        checkpoint.putStringSet(key + "-deferred", Set.copyOf(deferred));
+        if (next == null) {
+            checkpoint.putLong(key, tag).remove(key + "-next").remove(key + "-max");
+        } else {
+            checkpoint.putString(key + "-next", next).putLong(key + "-max", tag);
+        }
+        if (!checkpoint.commit()) {
+            throw new IOException("Unable to store legacy PDC cursor");
+        }
     }
 
     private int pushPasskey(Account account, NativePasskeys nativeKeys, Local row, String owner,
@@ -187,9 +256,6 @@ final class PasskeyBridge {
         if (!local.present()) {
             throw new IOException("Credential could not be exported");
         }
-        if (!current(row)) {
-            return 0;
-        }
         LegacyPdc.Record remote = null;
         JSONObject candidate = local.content();
         if (row.id != null) {
@@ -200,43 +266,73 @@ final class PasskeyBridge {
                 throw new IOException("Linked native passkey changed identity");
             }
             if (!remote.live()) {
-                return 0;
+                throw new LocalConflict("Cloud deletion intersects a local edit");
             }
-            if (remote.etag() != row.etag) {
-                return 0;
+            if (remote.etag() < row.etag) {
+                throw new IOException("Cloud revision is older than the local checkpoint");
             }
             if (remote.sameCredential(candidate) && sameDisplay(remote.content(), candidate)) {
                 saveLive(account, row, remote, owner, version);
                 return 0;
             }
+            if (remote.etag() != row.etag) {
+                throw new LocalConflict("Local and cloud passkey edits overlap");
+            }
         }
         requireActive(account);
         if (remote == null) {
-            rememberCreate(owner, row, candidate, version);
             if (!current(row)) {
-                return 0;
+                throw new IOException("Local passkey changed before recording create");
             }
+            rememberCreate(owner, row, candidate, version);
+        }
+        if (!current(row)) {
+            throw new IOException("Local passkey changed before upload");
         }
         LegacyPdc.Receipt receipt = pdc.write(remote, candidate);
         if (receipt.conflict() && remote != null) {
-            return 0;
+            throw new IOException("Cloud revision changed during upload");
         }
         LegacyPdc.Record confirmed = pdc.get(receipt.record().id());
+        if (!receipt.record().id().equals(confirmed.id())) {
+            throw new IOException("Cloud readback returned a different record");
+        }
         if (!confirmed.live() && receipt.conflict()) {
-            return 0;
+            throw new LocalConflict("Cloud deletion intersects an unconfirmed create");
         }
         verifyWritten(confirmed, candidate, version);
+        if (receipt.conflict() && !sameDisplay(confirmed.content(), candidate)) {
+            // A previous create may have reached the cloud before the local row was linked.
+            remote = confirmed;
+            String originalDisplay = cursors.getString(createKey(owner, row.credential) + "-display", null);
+            requireActive(account);
+            if (!current(row)) {
+                throw new IOException("Local passkey changed during create reconciliation");
+            }
+            if (displayFingerprint(candidate).equals(originalDisplay)) {
+                nativeKeys.restore(confirmed, version);
+                saveLive(account, row, confirmed, owner, version);
+                return 0;
+            }
+            if (!displayFingerprint(confirmed.content()).equals(originalDisplay)) {
+                throw new LocalConflict("Unconfirmed create has competing display edits");
+            }
+            receipt = pdc.write(remote, candidate);
+            if (receipt.conflict()) {
+                throw new IOException("Cloud revision changed during create reconciliation");
+            }
+            confirmed = pdc.get(remote.id());
+            verifyWritten(confirmed, candidate, version);
+        }
         if ((!receipt.conflict() && (receipt.record().etag() != confirmed.etag()
                 || !candidate.getString("origin").equals(confirmed.content().getString("origin"))))
                 || (remote != null && !remote.id().equals(confirmed.id()))) {
             throw new IOException("Legacy passkey write changed before readback");
         }
-        if (!receipt.conflict() || sameDisplay(confirmed.content(), candidate)) {
-            saveLive(account, row, confirmed, owner, version);
-            if (remote == null) {
-                cursors.edit().remove(createKey(owner, row.credential)).commit();
-            }
+        if (!sameDisplay(confirmed.content(), candidate)) {
+            throw new IOException("Cloud did not confirm passkey display fields");
         }
+        saveLive(account, row, confirmed, owner, version);
         return receipt.conflict() ? 0 : 1;
     }
 
@@ -246,8 +342,11 @@ final class PasskeyBridge {
         verifyLink(row, remote, version);
         if (!remote.live()) {
             requireActive(account);
-            if (remote.etag() != row.etag || !current(row)) {
-                throw new IOException("Pending local restore conflicts with cloud revision");
+            if (remote.etag() != row.etag) {
+                throw new LocalConflict("Pending local restore conflicts with cloud revision");
+            }
+            if (!current(row)) {
+                throw new IOException("Local passkey changed before restore");
             }
             if (pdc.restore(remote).conflict()) {
                 throw new IOException("Legacy passkey restore conflict");
@@ -262,15 +361,15 @@ final class PasskeyBridge {
     }
 
     private int pushDeletion(Account account, NativePasskeys nativeKeys, Local row, long version) throws Exception {
-        if (row.id == null || (row.hasTombstone() && row.state == DELETED)) {
-            return 0;
-        }
         LegacyPdc.Record remote = pdc.get(row.id);
         verifyLink(row, remote, version);
         if (remote.live()) {
             requireActive(account);
-            if (remote.etag() != row.etag || !current(row)) {
-                throw new IOException("Pending local deletion conflicts with cloud revision");
+            if (remote.etag() != row.etag) {
+                throw new LocalConflict("Pending local deletion conflicts with cloud revision");
+            }
+            if (!current(row)) {
+                throw new IOException("Local passkey changed before cloud deletion");
             }
             LegacyPdc.Receipt result = pdc.delete(remote);
             if (result.conflict()) {
@@ -304,8 +403,7 @@ final class PasskeyBridge {
                         && (row == null || current(row)) && !pdc.delete(latest).conflict()) {
                     LegacyPdc.Record deleted = pdc.get(latest.id());
                     if (!deleted.live() && latest.uniqueKey().equals(deleted.uniqueKey())) {
-                        cursors.edit().remove(createKey(owner, remote.credentialId()))
-                                .remove(removedKey(owner, remote.credentialId())).commit();
+                        forgetCreate(owner, remote.credentialId(), version, remote.uniqueKey());
                         return 0;
                     }
                 }
@@ -313,10 +411,21 @@ final class PasskeyBridge {
             // The upload may have reached the cloud before the local create was reconciled.
             throw new IOException("Unresolved local create or removal");
         }
-        if (row != null && (!eligible(row, owner, version) || row.state == PURGED
-                || (row.state == DELETED && !row.hasTombstone())
-                || (row.id != null && !row.id.equals(remote.id())) || row.etag >= remote.etag())) {
-            return 0;
+        if (row != null) {
+            if (!eligible(row, owner, version) || (row.id != null && !row.id.equals(remote.id()))) {
+                return 0;
+            }
+            if (row.id != null && row.etag >= remote.etag()) {
+                if (createdLocally != null && remote.uniqueKey().equals(row.uniqueKey)) {
+                    forgetCreate(owner, row.credential, version, remote.uniqueKey());
+                }
+                return 0;
+            }
+            // The upload scan revisits pending edits and deletions, even after the pull cursor advances.
+            if (row.state == PURGED || (row.state == DELETED && !row.hasTombstone())
+                    || (row.state == UPDATED && !row.hasTombstone())) {
+                return 0;
+            }
         }
         NativePasskeys.Export existing = nativeKeys.export(remote.credentialId(), version);
         if (existing.present() && !remote.sameCredential(existing.content())) {
@@ -326,17 +435,19 @@ final class PasskeyBridge {
             throw new IOException("Unable to check native credential presence");
         }
         boolean needsImport = !existing.present() || !sameDisplay(remote.content(), existing.content());
+        if (needsImport && row != null && row.id == null && createdLocally != null && existing.present()) {
+            return 0;
+        }
         if (needsImport) {
             requireActive(account);
-            if (row == null ? single("credentialId=?", remote.credentialId()) != null : !current(row)) {
-                // Do not advance the watermark across a simultaneous native edit.
-                throw new IOException("Local passkey changed during pull");
-            }
             LegacyPdc.Record latest = pdc.get(remote.id());
             if (!latest.live() || latest.etag() != remote.etag() || !latest.sameCredential(remote.content())) {
                 throw new IOException("Legacy passkey changed before import");
             }
             requireActive(account);
+            if (row == null ? single("credentialId=?", remote.credentialId()) != null : !current(row)) {
+                throw new IOException("Local passkey changed during pull");
+            }
             nativeKeys.restore(latest, version);
         }
         saveLive(account, row, remote, owner, version);
@@ -350,7 +461,18 @@ final class PasskeyBridge {
             String credential = remote.credentialId();
             if (!credential.isEmpty() && (version + ":" + remote.uniqueKey())
                     .equals(cursors.getString(createKey(owner, credential), null))) {
-                throw new IOException("Cloud deletion intersects an unconfirmed local create");
+                Local unlinked = single("credentialId=?", credential);
+                boolean removed = unlinked == null ? cursors.getBoolean(removedKey(owner, credential), false)
+                        : unlinked.id == null && eligible(unlinked, owner, version) && unlinked.removing();
+                if (!removed) {
+                    throw new IOException("Cloud deletion intersects an unconfirmed local create");
+                }
+                LegacyPdc.Record latest = pdc.get(remote.id());
+                if (latest.live() || latest.etag() != remote.etag() || !latest.uniqueKey().equals(remote.uniqueKey())) {
+                    throw new IOException("Cloud removal changed during reconciliation");
+                }
+                requireActive(account);
+                forgetCreate(owner, credential, version, remote.uniqueKey());
             }
             return 0;
         }
@@ -358,7 +480,8 @@ final class PasskeyBridge {
             return 0;
         }
         if (row.state == UPDATED) {
-            throw new IOException("Cloud deletion conflicts with a pending local edit");
+            // The linked dirty row keeps this conflict visible to the next upload scan.
+            return 0;
         }
         verifyLink(row, remote, version);
         requireActive(account);
@@ -425,13 +548,13 @@ final class PasskeyBridge {
         } else {
             updateIfUnchanged(row, values);
         }
+        forgetCreate(owner, record.credentialId(), version, record.uniqueKey());
     }
 
     private void saveTombstone(Account account, Local row, LegacyPdc.Record record) throws Exception {
         requireActive(account);
         if (row.state == PURGED) {
-            if (resolver.delete(FIDO, "_id=? AND localStatus=? AND modificationTime=? AND eTag=?",
-                    rowSelection(row)) != 1) {
+            if (resolver.delete(FIDO, UNCHANGED, rowSelection(row)) != 1) {
                 throw new IOException("Local passkey changed during purge");
             }
             return;
@@ -444,15 +567,15 @@ final class PasskeyBridge {
     }
 
     private void updateIfUnchanged(Local row, ContentValues values) throws IOException {
-        if (resolver.update(FIDO, values, "_id=? AND localStatus=? AND modificationTime=? AND eTag=?",
-                rowSelection(row)) != 1) {
+        if (resolver.update(FIDO, values, UNCHANGED, rowSelection(row)) != 1) {
             throw new IOException("Local passkey changed during reconciliation");
         }
     }
 
     private static String[] rowSelection(Local row) {
         return new String[]{Long.toString(row.row), Integer.toString(row.state),
-                Long.toString(row.modified), Long.toString(row.etag)};
+                Long.toString(row.modified), Long.toString(row.etag),
+                row.displayName == null ? "" : row.displayName, row.packageName == null ? "" : row.packageName};
     }
 
     private List<Local> query(String where, String... args) throws IOException {
@@ -464,7 +587,8 @@ final class PasskeyBridge {
             while (cursor.moveToNext()) {
                 records.add(new Local(cursor.getLong(0), cursor.getString(1), cursor.getString(2),
                         cursor.getString(3), cursor.getString(4), cursor.getLong(5), cursor.getString(6),
-                        cursor.getInt(7), cursor.getLong(8), cursor.getString(9), cursor.getLong(10)));
+                        cursor.getInt(7), cursor.getLong(8), cursor.getString(9), cursor.getLong(10),
+                        cursor.getString(11), cursor.getString(12)));
             }
         }
         return records;
@@ -510,6 +634,11 @@ final class PasskeyBridge {
     private static boolean sameDisplay(JSONObject left, JSONObject right) {
         return left.optString("displayName").equals(right.optString("displayName"))
                 && left.optString("packageName").equals(right.optString("packageName"));
+    }
+
+    private static String displayFingerprint(JSONObject content) throws Exception {
+        String name = content.optString("displayName");
+        return digest(name.length() + ":" + name + content.optString("packageName"));
     }
 
     private long installedVersion(Account account) throws Exception {
@@ -559,8 +688,19 @@ final class PasskeyBridge {
     }
 
     private void requireActive(Account account) throws Exception {
-        if (Thread.currentThread().isInterrupted() || !active(account)) {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedException("Legacy passkey sync interrupted");
+        }
+        if (!active(account)) {
             throw new IOException("Legacy passkey sync cancelled");
+        }
+    }
+
+    private void forgetCreate(String owner, String credential, long version, String uniqueKey) throws Exception {
+        String key = createKey(owner, credential);
+        if ((version + ":" + uniqueKey).equals(cursors.getString(key, null))
+                && !cursors.edit().remove(key).remove(key + "-display").remove(removedKey(owner, credential)).commit()) {
+            throw new IOException("Unable to clear confirmed cloud create");
         }
     }
 
@@ -571,7 +711,8 @@ final class PasskeyBridge {
         if (existing != null && !existing.equals(unique)) {
             throw new IOException("Pending create identity changed");
         }
-        if (existing == null && !cursors.edit().putString(key, unique).commit()) {
+        if (existing == null && !cursors.edit().putString(key, unique)
+                .putString(key + "-display", displayFingerprint(candidate)).commit()) {
             throw new IOException("Unable to persist pending cloud create");
         }
     }
