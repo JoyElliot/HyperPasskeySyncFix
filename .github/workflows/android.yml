@@ -34,7 +34,8 @@ jobs:
           java-version: '17'
           cache: gradle
       - name: Install Android SDK
-        run: sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0'
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-37.0' 'build-tools;36.0.0'
       - name: Lint and build APK
         run: ./gradlew --console=plain ":app:lint${VARIANT^}" ":app:assemble${VARIANT^}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -59,7 +60,7 @@ jobs:
           path: unsigned
       - name: Check APK identity and tag
         run: |
-          sdkmanager 'build-tools;36.0.0'
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'build-tools;36.0.0'
           apk=unsigned/app-release-unsigned.apk
           analyzer="$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer"
           [[ "$("$analyzer" manifest application-id "$apk")" == dev.localtest.xiaomicloudsync ]]
