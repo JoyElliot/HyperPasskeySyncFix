@@ -28,6 +28,8 @@ An LSPosed fix for Xiaomi's native passkey cloud sync on older devices ported to
 
 ## 构建
 
+推送到 `main` 或向 `main` 提交 PR 时，GitHub Actions 会运行 lint 并构建 debug APK。打开 [Android APK 工作流](https://github.com/JoyElliot/HyperPasskeySyncFix/actions/workflows/android.yml)，可在对应运行的 Artifacts 中下载 `apk-debug`。
+
 准备 JDK 17 或更高版本、Android SDK Platform 37.0 和 Build Tools 36.0.0。模块以 Android 17（API 37）为目标，最低安装版本为 Android 14（API 34）。配置 `ANDROID_HOME`，或在 Android Studio 中指定 SDK 路径。
 
 ```sh
@@ -37,3 +39,9 @@ An LSPosed fix for Xiaomi's native passkey cloud sync on older devices ported to
 在 Windows 上用 `gradlew.bat :app:assembleDebug`。产物位于 `app/build/outputs/apk/debug/app-debug.apk`，使用本机调试签名。覆盖已安装的发布版需要匹配原 APK 的签名。
 
 模块编译依赖由框架提供的 [libxposed API 102](https://github.com/libxposed/api)。项目使用 [Apache License 2.0](LICENSE)。
+
+## 发布
+
+更新 `app/build.gradle.kts` 中的 `versionCode` 和 `versionName`，将改动合入 `main`，然后推送与 `versionName` 一致的 `v<版本号>` 标签。使用带注释的标签时，标签说明会成为发布说明。
+
+GitHub Actions 会从该标签构建 release APK，核对包名和版本，用 `release` 环境中的原发布密钥签名，校验证书指纹后将 APK 发布到 [GitHub Releases](https://github.com/JoyElliot/HyperPasskeySyncFix/releases)。构建或上传失败时，可以在 Actions 中重新运行该标签的任务。

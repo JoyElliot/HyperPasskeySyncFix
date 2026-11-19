@@ -1,0 +1,112 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      VARIANT: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || 'debug' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: Install Android SDK
+        run: sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0'
+      - name: Lint and build APK
+        run: ./gradlew --console=plain ":app:lint${VARIANT^}" ":app:assemble${VARIANT^}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apk-${{ env.VARIANT }}
+          path: app/build/outputs/apk/${{ env.VARIANT }}/*.apk
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: release
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: apk-release
+          path: unsigned
+      - name: Check APK identity and tag
+        run: |
+          sdkmanager 'build-tools;36.0.0'
+          apk=unsigned/app-release-unsigned.apk
+          analyzer="$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer"
+          [[ "$("$analyzer" manifest application-id "$apk")" == dev.localtest.xiaomicloudsync ]]
+          version="$("$analyzer" manifest version-name "$apk")"
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match APK version $version"
+            exit 1
+          fi
+      - name: Sign APK and verify the release certificate
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          umask 077
+          keystore=$(mktemp "$RUNNER_TEMP/signing-XXXXXX")
+          trap 'rm -f -- "$keystore"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          signer="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          asset="HyperPasskeySyncFix-$GITHUB_REF_NAME.apk"
+          "$signer" sign --ks "$keystore" --ks-type PKCS12 --ks-key-alias release \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --v4-signing-enabled false --out "$asset" unsigned/app-release-unsigned.apk
+          fingerprint=$("$signer" verify --print-certs "$asset" | sed -n 's/^.*certificate SHA-256 digest: //p' | sort -u)
+          [[ "$fingerprint" == 71bad2d3ab344209160617f3693cf0e3afc86587f4923d10a8fedb3470067177 ]]
+          sha256sum "$asset"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          asset="HyperPasskeySyncFix-$tag.apk"
+          if existing=$(gh release view "$tag" --json isDraft,assets); then
+            if [[ $(jq -r .isDraft <<< "$existing") == false ]]; then
+              jq -e --arg name "$asset" 'any(.assets[]; .name == $name and .state == "uploaded")' <<< "$existing"
+              echo "Release $tag is already published."
+              exit 0
+            fi
+          else
+            ref=$(gh api "repos/$GH_REPO/git/ref/tags/$tag")
+            if [[ $(jq -r .object.type <<< "$ref") == tag ]]; then
+              notes="$RUNNER_TEMP/release-notes.md"
+              gh api "repos/$GH_REPO/git/tags/$(jq -r .object.sha <<< "$ref")" --jq .message > "$notes"
+              gh release create "$tag" --verify-tag --draft --title "$tag" --notes-file "$notes"
+            else
+              gh release create "$tag" --verify-tag --draft --title "$tag" --generate-notes
+            fi
+          fi
+          gh release upload "$tag" "$asset" --clobber
+          gh release edit "$tag" --draft=false
